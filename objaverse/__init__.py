@@ -108,7 +108,12 @@ def _download_object(
     )
     # wget the file and put it in local_path
     os.makedirs(os.path.dirname(tmp_local_path), exist_ok=True)
-    urllib.request.urlretrieve(hf_url, tmp_local_path)
+
+    try:
+        urllib.request.urlretrieve(hf_url, tmp_local_path)
+    except Exception as e:
+        warnings.warn(f"Could not download object with uid {uid}. Skipping it.")
+        return uid, None
 
     os.rename(tmp_local_path, local_path)
 
@@ -139,57 +144,43 @@ def load_objects(uids: List[str], download_processes: int = 1) -> Dict[str, str]
     """
     object_paths = _load_object_paths()
     out = {}
+
+    uids_to_download = []
+    for uid in uids:
+        if uid.endswith(".glb"):
+            uid = uid[:-4]
+        if uid not in object_paths:
+            warnings.warn(f"Could not find object with uid {uid}. Skipping it.")
+            continue
+        object_path = object_paths[uid]
+        local_path = os.path.join(_VERSIONED_PATH, object_path)
+        if os.path.exists(local_path):
+            out[uid] = local_path
+            continue
+        uids_to_download.append((uid, object_path))
+    if len(uids_to_download) == 0:
+        return out
+    start_file_count = len(
+        glob.glob(os.path.join(_VERSIONED_PATH, "glbs", "*", "*.glb"))
+    )
+    
     if download_processes == 1:
-        uids_to_download = []
-        for uid in uids:
-            if uid.endswith(".glb"):
-                uid = uid[:-4]
-            if uid not in object_paths:
-                warnings.warn(f"Could not find object with uid {uid}. Skipping it.")
-                continue
-            object_path = object_paths[uid]
-            local_path = os.path.join(_VERSIONED_PATH, object_path)
-            if os.path.exists(local_path):
-                out[uid] = local_path
-                continue
-            uids_to_download.append((uid, object_path))
-        if len(uids_to_download) == 0:
-            return out
-        start_file_count = len(
-            glob.glob(os.path.join(_VERSIONED_PATH, "glbs", "*", "*.glb"))
-        )
         for uid, object_path in uids_to_download:
             uid, local_path = _download_object(
                 uid, object_path, len(uids_to_download), start_file_count
             )
-            out[uid] = local_path
-    else:
-        args = []
-        for uid in uids:
-            if uid.endswith(".glb"):
-                uid = uid[:-4]
-            if uid not in object_paths:
-                warnings.warn(f"Could not find object with uid {uid}. Skipping it.")
-                continue
-            object_path = object_paths[uid]
-            local_path = os.path.join(_VERSIONED_PATH, object_path)
-            if not os.path.exists(local_path):
-                args.append((uid, object_paths[uid]))
-            else:
+            if local_path is not None:
                 out[uid] = local_path
-        if len(args) == 0:
-            return out
+    else:
         print(
-            f"starting download of {len(args)} objects with {download_processes} processes"
+            f"starting download of {len(uids_to_download)} objects with {download_processes} processes"
         )
-        start_file_count = len(
-            glob.glob(os.path.join(_VERSIONED_PATH, "glbs", "*", "*.glb"))
-        )
-        args_list = [(*arg, len(args), start_file_count) for arg in args]
+        args_list = [(*arg, len(uids_to_download), start_file_count) for arg in uids_to_download]
         with multiprocessing.Pool(download_processes) as pool:
             r = pool.starmap(_download_object, args_list)
             for uid, local_path in r:
-                out[uid] = local_path
+                if local_path is not None:
+                    out[uid] = local_path
     return out
 
 
