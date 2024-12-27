@@ -383,6 +383,114 @@ class GitHubDownloader(ObjaverseSource):
         return out
 
     @classmethod
+    def _process_repo_downloaded(
+        cls,
+        repo_id: str,
+        fs: fsspec.AbstractFileSystem,
+        base_dir: str,
+        save_repo_format: Optional[Literal["zip", "tar", "tar.gz", "files"]],
+        expected_objects: Dict[str, str],
+        handle_found_object: Optional[Callable],
+        handle_modified_object: Optional[Callable],
+        handle_missing_object: Optional[Callable],
+        handle_new_object: Optional[Callable],
+        commit_hash: Optional[str],
+    ) -> Dict[str, str]:
+        """Process a single repo that has been downloaded.
+
+        Args:
+            repo_id (str): GitHub repo ID in the format of organization/repo.
+            fs (fsspec.AbstractFileSystem): File system to use for saving the repo.
+            base_dir (str): Base directory to save the repo to.
+            expected_objects (Dict[str, str]): Dictionary of objects that one expects to
+                find in the repo. Keys are the "fileIdentifier" (i.e., the GitHub URL in
+                this case) and values are the "sha256" of the objects.
+            {and the rest of the args are the same as download_objects}
+
+        Returns:
+            Dict[str, str]: A dictionary that maps from the "fileIdentifier" to the path
+                of the downloaded object.
+        """
+        org, repo = repo_id.split("/")
+        out = {}
+
+        if save_repo_format != "files":
+            raise NotImplementedError("save_repo_format must be 'files'")
+        
+        # get the directory of downloaded repo
+        target_directory = os.path.join(base_dir, "repos", org, repo)
+
+        # get all the files in the repo
+        files = cls._list_files(target_directory)
+        files_with_3d_extension = [
+            file
+            for file in files
+            if any(file.lower().endswith(ext) for ext in FILE_EXTENSIONS)
+        ]
+
+        # load the file hashes from the json file
+        with open(
+            os.path.join(target_directory, ".objaverse-file-hashes.json"),
+            "r",
+            encoding="utf-8",
+        ) as f:
+            file_hashes = json.load(f)
+
+        # get the sha256 for each file
+        sha256_to_fileIdentifier = {x["sha256"]: x["fileIdentifier"] for x in file_hashes}
+        for file in tqdm(files_with_3d_extension, desc="Handling 3D object files"):
+            file_hash = get_file_hash(file)
+            github_url = sha256_to_fileIdentifier.get(file_hash)
+
+            # handle the object under different conditions
+            if github_url in expected_objects:
+                out[github_url] = file[len(target_directory) + 1 :]
+                if expected_objects[github_url] == file_hash:
+                    if handle_found_object is not None:
+                        handle_found_object(
+                            local_path=file,
+                            file_identifier=github_url,
+                            sha256=file_hash,
+                            metadata=dict(
+                                github_organization=org, github_repo=repo
+                            ),
+                        )
+                else:
+                    if handle_modified_object is not None:
+                        handle_modified_object(
+                            local_path=file,
+                            file_identifier=github_url,
+                            new_sha256=file_hash,
+                            old_sha256=expected_objects[github_url],
+                            metadata=dict(
+                                github_organization=org, github_repo=repo
+                            ),
+                        )
+            elif handle_new_object is not None:
+                handle_new_object(
+                    local_path=file,
+                    file_identifier=github_url,
+                    sha256=file_hash,
+                    metadata=dict(github_organization=org, github_repo=repo),
+                )
+
+        for file_identifier in out.copy():
+            out[file_identifier] = os.path.join(target_directory, out[file_identifier])
+
+        # get each object that was missing from the expected objects
+        if handle_missing_object is not None:
+            obtained_urls = {x["fileIdentifier"] for x in file_hashes}
+            for github_url, sha256 in expected_objects.items():
+                if github_url not in obtained_urls:
+                    handle_missing_object(
+                        file_identifier=github_url,
+                        sha256=sha256,
+                        metadata=dict(github_organization=org, github_repo=repo),
+                    )
+
+        return out
+
+    @classmethod
     def _list_files(cls, root_dir: str) -> List[str]:
         return [
             os.path.join(root, f)
@@ -448,6 +556,47 @@ class GitHubDownloader(ObjaverseSource):
         repo_id = "/".join(repo_id_hash.split("/")[:2])
         commit_hash = repo_id_hash.split("/")[2]
         return cls._process_repo(
+            repo_id=repo_id,
+            fs=fs,
+            base_dir=base_dir,
+            save_repo_format=save_repo_format,
+            expected_objects=expected_objects,
+            handle_found_object=handle_found_object,
+            handle_modified_object=handle_modified_object,
+            handle_missing_object=handle_missing_object,
+            handle_new_object=handle_new_object,
+            commit_hash=commit_hash,
+        )
+    
+    @classmethod
+    def _parallel_process_repo_downloaded(cls, args) -> Dict[str, str]:
+        """Helper function to process a repo in parallel.
+
+        Note: This function is used to parallelize the processing of repos. It is not
+        intended to be called directly.
+
+        Args:
+            args (Tuple): Tuple of arguments to pass to _process_repo.
+
+        Returns:
+            Dict[str, str]: A dictionary that maps from the "fileIdentifier" to the path
+                of the downloaded object.
+        """
+
+        (
+            repo_id_hash,
+            fs,
+            base_dir,
+            save_repo_format,
+            expected_objects,
+            handle_found_object,
+            handle_modified_object,
+            handle_missing_object,
+            handle_new_object,
+        ) = args
+        repo_id = "/".join(repo_id_hash.split("/")[:2])
+        commit_hash = repo_id_hash.split("/")[2]
+        return cls._process_repo_downloaded(
             repo_id=repo_id,
             fs=fs,
             base_dir=base_dir,
@@ -604,6 +753,60 @@ class GitHubDownloader(ObjaverseSource):
             f"Provided {len(repo_ids)} repoIds with {len(objects)} objects to process."
         )
 
+        groups = list(objects.groupby("repoIdHash"))
+        with Pool(processes=processes) as pool:
+            out_list = list(
+                tqdm(
+                    pool.imap_unordered(cls._process_group, groups),
+                    total=len(groups),
+                    desc="Grouping objects by repository",
+                )
+            )
+        objects_per_repo_id_hash = dict(out_list)
+
+        # ---------------------------------------------------------------------
+        # get repoIds that have already been downloaded
+        if kwargs.get("include_downloaded_objects", True):
+            repo_id_hashes_downloaded = [
+                repo_id_hash
+                for repo_id_hash in repo_id_hashes
+                if "/".join(repo_id_hash.split("/")[:2]) in downloaded_repo_ids
+            ]
+
+            logger.info(
+                f"Found {len(downloaded_repo_ids)} repoIds already downloaded."
+            )
+
+            all_args = [
+                (
+                    repo_id_hash,
+                    fs,
+                    path,
+                    save_repo_format,
+                    objects_per_repo_id_hash[repo_id_hash],
+                    handle_found_object,
+                    handle_modified_object,
+                    handle_missing_object,
+                    handle_new_object,
+                )
+                for repo_id_hash in repo_id_hashes_downloaded
+            ]
+
+            with Pool(processes=processes) as pool:
+                # use tqdm to show progress
+                out = list(
+                    tqdm(
+                        pool.imap_unordered(cls._parallel_process_repo_downloaded, all_args),
+                        total=len(all_args),
+                        desc="Inspecting downloaded repositories",
+                    )
+                )
+
+            out_dict = {}
+            for x in out:
+                out_dict.update(x)
+
+        # ---------------------------------------------------------------------
         # remove repoIds that have already been downloaded
         repo_ids_to_download = repo_ids - downloaded_repo_ids
         repo_id_hashes_to_download = [
@@ -615,18 +818,6 @@ class GitHubDownloader(ObjaverseSource):
         logger.info(
             f"Found {len(repo_ids_to_download)} repoIds not yet downloaded. Downloading now..."
         )
-
-        # get the objects to download
-        groups = list(objects.groupby("repoIdHash"))
-        with Pool(processes=processes) as pool:
-            out_list = list(
-                tqdm(
-                    pool.imap_unordered(cls._process_group, groups),
-                    total=len(groups),
-                    desc="Grouping objects by repository",
-                )
-            )
-        objects_per_repo_id_hash = dict(out_list)
 
         all_args = [
             (
@@ -653,7 +844,6 @@ class GitHubDownloader(ObjaverseSource):
                 )
             )
 
-        out_dict = {}
         for x in out:
             out_dict.update(x)
 
