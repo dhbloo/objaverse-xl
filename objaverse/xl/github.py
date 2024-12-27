@@ -227,6 +227,17 @@ class GitHubDownloader(ObjaverseSource):
 
             # use the commit hash if specified
             repo_commit_hash = cls._get_commit_hash_from_local_git_dir(target_directory)
+            if repo_commit_hash is None:
+                logger.error(f"Could not get commit hash for {repo_id}")
+                if handle_missing_object is not None:
+                    for github_url, sha256 in expected_objects.items():
+                        handle_missing_object(
+                            file_identifier=github_url,
+                            sha256=sha256,
+                            metadata=dict(github_organization=org, github_repo=repo),
+                        )
+                return {}
+
             if commit_hash is not None:
                 keep_going = True
                 if repo_commit_hash != commit_hash:
@@ -518,13 +529,19 @@ class GitHubDownloader(ObjaverseSource):
     def _get_commit_hash_from_local_git_dir(cls, local_git_dir: str) -> str:
         """Get the commit hash of the local git directory."""
         # get the git hash of the repo
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=local_git_dir,
-            capture_output=True,
-            check=True,
-        )
-        commit_hash = result.stdout.strip().decode("utf-8")
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=local_git_dir,
+                capture_output=True,
+                check=True,
+            )
+            commit_hash = result.stdout.strip().decode("utf-8")
+        except subprocess.CalledProcessError as e:
+            logger.error("Error getting commit hash:", e)
+            logger.error(e.stdout)
+            logger.error(e.stderr)
+            commit_hash = None
         return commit_hash
 
     @classmethod
