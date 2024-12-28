@@ -131,30 +131,65 @@ class GitHubDownloader(ObjaverseSource):
         return f"{org}/{repo}/{commit_hash}"
 
     @classmethod
-    def _git_shallow_clone(cls, repo_url: str, target_directory: str) -> bool:
+    def _git_shallow_clone(cls, repo_url: str, target_directory: str, max_retries=10) -> bool:
         """Helper function to shallow clone a repo with git.
 
         Args:
             repo_url (str): URL of the repo to clone.
             target_directory (str): Directory to clone the repo to.
+            max_retries (int, optional): Maximum number of retries to clone the repo.
 
         Returns:
             bool: True if the clone was successful, False otherwise.
         """
-        return cls._run_command_with_check(
-            ["git", "clone", "--depth", "1", repo_url, target_directory],
-        )
+        # return cls._run_command_with_check(
+        #     ["git", "clone", "--depth", "1", repo_url, target_directory],
+        # )
+
+        # Step 0: Ensure the target directory exists
+        os.makedirs(target_directory, exist_ok=True)
+
+        # Step 1: Initialize an empty Git repository
+        if not cls._run_command_with_check(["git", "init"], cwd=target_directory):
+            return False
+        
+        # Step 2: Add the remote repository
+        if not cls._run_command_with_check(["git", "remote", "add", "origin", repo_url], cwd=target_directory):
+            return False
+        
+        # Step 3: Fetch the latest commit with depth=1
+        for attempt in range(max_retries):
+            suc, err = cls._run_command_with_check(["git", "fetch", "--depth", "1", "origin"], 
+                                                   cwd=target_directory, 
+                                                   return_error=True)
+            if suc:
+                break
+            if attempt == max_retries - 1 or (
+                ("remote end hung up unexpectedly" not in err.stderr) and 
+                ("RPC failed" not in err.stderr) and
+                ("gnutls_handshake() failed" not in err.stderr)):
+                logger.error(f"Failed to fetch {repo_url} with error: {err.stderr}")
+                return False
+            logger.warning(f"Retrying to fetch {repo_url} for {attempt+1}/{max_retries} times...")
+        
+        # Step 4: Checkout the fetched commit
+        if not cls._run_command_with_check(["git", "checkout", "FETCH_HEAD"], cwd=target_directory):
+            return False
+        
+        return True
 
     @classmethod
     def _run_command_with_check(
-        cls, command: List[str], cwd: Optional[str] = None
-    ) -> bool:
+        cls, command: List[str], cwd: Optional[str] = None, return_error=False,
+    ) -> bool | tuple[bool, subprocess.CalledProcessError]:
         """Helper function to run a command and check if it was successful.
 
         Args:
             command (List[str]): Command to run.
             cwd (Optional[str], optional): Current working directory to run the command
                 in. Defaults to None.
+            return_error (bool, optional): Whether to return the error object if the
+                command was not successful. Defaults to False.
 
         Returns:
             bool: True if the command was successful, False otherwise.
@@ -168,12 +203,13 @@ class GitHubDownloader(ObjaverseSource):
                 stderr=subprocess.PIPE,
                 text=True,
             )
-            return True
+            return (True, None) if return_error else True
         except subprocess.CalledProcessError as e:
-            logger.error("Error:", e)
-            logger.error(e.stdout)
-            logger.error(e.stderr)
-            return False
+            if not return_error:
+                logger.error("Error:", e, "stderr:", e.stderr)
+                return False
+            else:
+                return (False, e)
 
     @classmethod
     def _process_repo(
@@ -538,9 +574,7 @@ class GitHubDownloader(ObjaverseSource):
             )
             commit_hash = result.stdout.strip().decode("utf-8")
         except subprocess.CalledProcessError as e:
-            logger.error("Error getting commit hash:", e)
-            logger.error(e.stdout)
-            logger.error(e.stderr)
+            logger.error("Error getting commit hash:", e, "stderr:", e.stderr)
             commit_hash = None
         return commit_hash
 
